@@ -469,8 +469,8 @@ reduces them without incurring seq initialization"
   (-count [x]
     (loop [s (seq x) n 0]
       (if s
-	(recur (next s) (inc n))
-	n))))
+        (recur (next s) (inc n))
+        n))))
 
 (defn not
   "Returns true if x is logical false, false otherwise."
@@ -2026,6 +2026,122 @@ reduces them without incurring seq initialization"
   (reduce conj cljs.core.Vector/EMPTY coll)) ; using [] here causes infinite recursion
 
 (defn vector [& args] (vec args))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; PersistentVector ;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defn- tail-off [pv]
+  (let [cnt (.-cnt pv)]
+    (if (< cnt 32)
+      0
+      ;;; no >>> available but may not be an issue
+      (bit-shift-left (bit-shift-right (dec cnt) 5) 5))))
+
+(defn- new-path [level node]
+  (loop [ll level
+         ret node]
+         (if (= 0 ll)
+           ret
+           (let [embed ret
+                 ret (aclone cljs.core.PersistentVector/EMPTY_NODE)]
+             (aset ret 0 embed)
+             (recur (- level 5) ret)))))
+
+(defn- new-path-naive [level node]
+  (if (zero? level)
+    node
+    (let [ret (aclone cljs.core.PersistentVector/EMPTY_NODE)]
+      (aset ret 0 (new-path (- level 5) node))
+      ret)))
+
+(defn- push-tail [pv level parent tailnode]
+  (let [ret (aclone parent)
+        subidx (bit-and (bit-shift-right (dec (-count pv)) level) 0x01f)]
+    (if (= 5 level)
+      (do
+        (aset ret subidx tailnode)
+        ret)
+      (if-let [child (aget parent subidx)]
+        (let [node-to-insert (push-tail pv (- level 5) child tailnode)]
+          (aset ret subidx node-to-insert)
+          ret)
+        (let [node-to-insert (new-path (- level 5) tailnode)]
+          (aset ret subidx node-to-insert)
+          ret)))))
+
+
+(defn- array-for [pv i]
+  (if (and (<= 0 i) (< i (.-cnt pv)))
+    (if (>= i (tail-off pv))
+      (.-tail pv)
+      (loop [node (.-root pv)
+             level (.-shift pv)]
+        (if (pos? level)
+          (recur (aget node (bit-and (bit-shift-right i level) 0x01f))
+                 (- level 5))
+          node )))
+    #_(throw (js/Error. (str "No item " n " in vector of length " cnt)))))
+
+(deftype PersistentVector [meta cnt shift root tail]
+  IWithMeta
+  (-with-meta [coll meta] (PersistentVector. meta cnt shift root tail))
+
+  IMeta
+  (-meta [coll] meta)
+
+  ICollection
+  (-conj [coll o]
+    (if (< (- cnt (tail-off coll)) 32)
+      (let [new-tail (aclone tail)]
+        (.push new-tail o)
+        (PersistentVector. meta (inc cnt) shift root new-tail))
+
+      (let [root-overflow? (> (bit-shift-right cnt 5) (bit-shift-left 1 shift))
+            new-shift (if root-overflow? (+ shift 5) shift)
+            new-root (if root-overflow?
+                       (let [n-r (aclone cljs.core.PersistentVector/EMPTY_NODE)]
+                           (aset n-r 0 root)
+                           (aset n-r 1 (new-path shift tail))
+                           n-r)
+                       (push-tail coll shift root tail))]
+        (PersistentVector. meta (inc cnt) new-shift new-root (array o)))))
+
+  ISequential
+
+  IEmptyableCollection
+  (-empty [coll] (with-meta cljs.core.PersistentVector/EMPTY meta))
+
+  ISeqable
+  (-seq [coll]
+    (when (> cnt 0)
+      (let [vector-seq
+             (fn vector-seq [i]
+               (lazy-seq
+                 (when (< i cnt)
+                   (cons (-nth coll i) (vector-seq (inc i))))))]
+        (vector-seq 0))))
+
+  ICounted
+  (-count [coll] cnt)
+
+  IIndexed
+  (-nth [coll n]
+    (aget (array-for coll n) (bit-and n 0x01f)))
+  (-nth [coll n not-found]
+    (if (and (<= 0 n) (< n cnt))
+      (-nth coll n)
+      not-found)))
+
+(set! cljs.core.PersistentVector/EMPTY_NODE (array nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil nil))
+(set! cljs.core.PersistentVector/EMPTY (PersistentVector. nil 0 5 cljs.core.PersistentVector/EMPTY_NODE (array)))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (deftype Subvec [meta v start end]
   IWithMeta
@@ -3002,6 +3118,9 @@ reduces them without incurring seq initialization"
   (-pr-seq [coll opts] (list "()"))
 
   Vector
+  (-pr-seq [coll opts] (pr-sequential pr-seq "[" " " "]" opts coll))
+
+  PersistentVector
   (-pr-seq [coll opts] (pr-sequential pr-seq "[" " " "]" opts coll))
 
   Subvec
